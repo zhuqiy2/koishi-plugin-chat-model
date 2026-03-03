@@ -4,3 +4,4 @@ test-connection.js
 *.log
 .DS_Store
 package-lock.json
+.npmrc

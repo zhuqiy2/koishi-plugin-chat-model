@@ -4,6 +4,11 @@
   "version": "1.1.4",
   "main": "index.js",
   "typings": "index.d.ts",
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "lib"
+  ],
   "license": "MIT",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
