@@ -1,0 +1,6 @@
+node_modules/
+.vscode/
+test-connection.js
+*.log
+.DS_Store
+package-lock.json

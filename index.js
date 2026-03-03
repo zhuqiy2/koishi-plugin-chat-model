@@ -22,7 +22,7 @@ exports.Config = Schema.object({
   triggerPrefix: Schema.string().description('触发前缀，不填则任何未命中命令的消息都会触发模型响应'),
   triggerPrivate: Schema.boolean().default(true).description('是否在私聊中自动触发'),
   triggerGroup: Schema.boolean().default(false).description('是否在群聊中自动触发'),
-  showThinkingMessage: Schema.boolean().default(false).description('是否显示"正在思考中..."(默认: 不显示)'),
+  showThinkingMessage: Schema.boolean().default(false).description('是否显示"正在思考中..."'),
   customModelAdapter: Schema.string().description('自定义模型适配器路径(仅modelType=custom时有效)'),
   usageLimit: Schema.object({
     enabled: Schema.boolean().default(false).description('是否启用使用限制'),
@@ -38,7 +38,19 @@ exports.using = ['database']
 exports.apply = (ctx, config) => {
   // 从lib目录加载适配器
   const ModelAdapter = loadModelAdapter(ctx, config)
-  const modelInstance = new ModelAdapter(ctx, config)
+  let modelInstance = new ModelAdapter(ctx, config)
+
+  // 监听配置更新，重新初始化适配器
+  ctx.on('config', (newConfig) => {
+    if (!newConfig || !newConfig.modelType) return;
+    try {
+      const NewModelAdapter = loadModelAdapter(ctx, newConfig)
+      modelInstance = new NewModelAdapter(ctx, newConfig)
+      ctx.logger.info('配置已更新，模型适配器已重新初始化')
+    } catch (error) {
+      ctx.logger.error(`重新初始化模型适配器失败: ${error.message}`)
+    }
+  })
 
   // 初始化数据库
   setupDatabase(ctx)
@@ -48,11 +60,15 @@ exports.apply = (ctx, config) => {
   
   // 注册middleware - 在消息中间件管道的末尾捕获未处理的消息
   ctx.middleware(async (session, next) => {
+    // 调试日志：检查收到的所有消息
+    ctx.logger.debug(`收到消息: [${session.userId}] ${session.content}`)
+    
     // 首先尝试使用Koishi的其他处理器处理消息
     const handled = await next()
     
     // 如果消息已被处理，或者是不应该触发的消息类型，则直接返回
     if (handled || shouldIgnoreMessage(session, config)) {
+      if (handled) ctx.logger.debug('消息已被其他中间件处理')
       return handled
     }
     
@@ -87,9 +103,14 @@ exports.apply = (ctx, config) => {
     }
     
     try {
+      let replyMessageId;
       // 可选显示"正在思考中..."的消息
       if (config.showThinkingMessage) {
-        await session.sendQueued('正在思考中...')
+        // 使用 sendQueued 发送，返回的是一个数组
+        const sent = await session.sendQueued('正在思考中...');
+        if (Array.isArray(sent) && sent.length > 0) {
+          replyMessageId = sent[0];
+        }
       }
       
       // 处理消息并发送回复
@@ -101,8 +122,14 @@ exports.apply = (ctx, config) => {
         return
       }
       
-      // 发送回复
-      await session.send(reply)
+      // 如果有思考中消息，尝试编辑它，否则直接发送
+      if (replyMessageId && session.bot.editMessage) {
+        await session.bot.editMessage(session.channelId, replyMessageId, reply).catch(async () => {
+          await session.send(reply)
+        })
+      } else {
+        await session.send(reply)
+      }
       
       // 更新用户使用计数
       if (config.usageLimit?.enabled) {
@@ -111,14 +138,12 @@ exports.apply = (ctx, config) => {
       
       // 标记消息为已处理，但不显式返回true
       session._handled = true
-      // 这里不返回任何值，避免"true"被发送出去
     } catch (error) {
       ctx.logger.error('处理消息时出错:', error)
       await session.send(`处理消息时出错: ${error.message}`)
-      // 标记已处理但不返回true
       session._handled = true
     }
-  }, true) // true表示这个中间件应该在所有其他中间件之后执行
+  }, true)
   
   // 注册清理上下文的命令
   ctx.command('清除上下文', '清除与AI助手的对话上下文')
@@ -230,13 +255,14 @@ function createMessageHandler(ctx, config, modelInstance) {
       ])
       
       // 添加助手回复到上下文
-      userContext.push({
-        role: 'assistant',
-        content: response
-      })
-      
-      // 保存更新的上下文
-      await saveUserContext(ctx, session.userId, userContext)
+      if (response) {
+        userContext.push({
+          role: 'assistant',
+          content: response
+        })
+        // 保存更新的上下文
+        await saveUserContext(ctx, session.userId, userContext)
+      }
       
       return response
     } catch (error) {
@@ -248,12 +274,14 @@ function createMessageHandler(ctx, config, modelInstance) {
 
 // 获取用户上下文
 async function getUserContext(ctx, userId) {
-  const record = await ctx.database.get('chatModelContext', { userId })
-  
-  if (record && record.length > 0) {
-    return record[0].context || []
+  try {
+    const record = await ctx.database.get('chatModelContext', { userId })
+    if (record && record.length > 0) {
+      return record[0].context || []
+    }
+  } catch (error) {
+    ctx.logger.error(`无法从数据库读取上下文: ${error.message}`)
   }
-  
   return []
 }
 
@@ -261,19 +289,24 @@ async function getUserContext(ctx, userId) {
 async function saveUserContext(ctx, userId, context) {
   const now = new Date().getTime()
   
-  // 尝试更新现有记录
-  const result = await ctx.database.set('chatModelContext', { userId }, {
-    context,
-    updatedAt: now
-  })
-  
-  // 如果没有更新任何记录，则创建新记录
-  if (result === 0) {
-    await ctx.database.create('chatModelContext', {
-      userId,
-      context,
-      updatedAt: now
-    })
+  try {
+    // 尝试更新现有记录
+    const records = await ctx.database.get('chatModelContext', { userId })
+    
+    if (records && records.length > 0) {
+      await ctx.database.set('chatModelContext', { userId }, {
+        context,
+        updatedAt: now
+      })
+    } else {
+      await ctx.database.create('chatModelContext', {
+        userId,
+        context,
+        updatedAt: now
+      })
+    }
+  } catch (error) {
+    ctx.logger.error(`保存上下文到数据库失败: ${error.message}`)
   }
 }
 
